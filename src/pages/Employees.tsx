@@ -136,8 +136,6 @@ export function Employees() {
     getOrCreatePayrollCycle,
     getPayrollLockStats,
     getEmployeeLocks,
-    validateHRLock,
-    validateFinanceLock,
     toggleHRLock,
     toggleFinanceLock,
     bulkHRLock,
@@ -235,6 +233,7 @@ export function Employees() {
     }
   }
 
+  /*
   const validateAllEmployees = async () => {
     const validationMap = new Map()
 
@@ -257,7 +256,9 @@ export function Employees() {
 
     setEmployeeValidation(validationMap)
   }
+  */
 
+  /*
   // Validate type vs amount consistency for an employee (using saved data, not edit state)
   const validateTypeAmountConsistencyForEmployee = (emp: any): RowValidationError => {
     const errors: RowValidationError = {}
@@ -286,6 +287,7 @@ export function Employees() {
 
     return errors
   }
+  */
 
   // Filter snapshot data client-side when viewing a snapshot
   const displayedEmployees = useMemo(() => {
