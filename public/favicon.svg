@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1e40af;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <!-- Background circle -->
+  <circle cx="50" cy="50" r="48" fill="url(#grad)"/>
+  <!-- Dollar sign / Payroll symbol -->
+  <text x="50" y="68" font-family="Arial, sans-serif" font-size="55" font-weight="bold" fill="white" text-anchor="middle">₹</text>
+  <!-- Small checkmark indicating completion/approval -->
+  <circle cx="75" cy="25" r="14" fill="#22c55e"/>
+  <path d="M68 25 L73 30 L82 20" stroke="white" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
