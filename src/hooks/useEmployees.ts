@@ -21,6 +21,7 @@ interface Filters {
   hrRemark: string
   salaryProcessingRequired: string
   paymentStatus: string
+  isActive: string // 'active', 'deactivated', or '' for all
 }
 
 export function useEmployees({ month, year }: UseEmployeesOptions) {
@@ -41,6 +42,7 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
     hrRemark: '',
     salaryProcessingRequired: '',
     paymentStatus: '',
+    isActive: 'active', // Default to showing only active employees
   })
 
   const [designations, setDesignations] = useState<Designation[]>([])
@@ -49,12 +51,9 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
   const [additions, setAdditions] = useState<Addition[]>([])
   const [incentives, setIncentives] = useState<Incentive[]>([])
 
-  const fetchEmployees = useCallback(async () => {
+  // Fetch reference data once on mount (departments, designations, etc.)
+  const fetchReferenceData = useCallback(async () => {
     try {
-      setLoading(true)
-      setError(null)
-
-      // Fetch departments, designations, deductions, additions, and incentives
       const [deptRes, desigRes, dedRes, addRes, incRes] = await Promise.all([
         supabase.from('departments').select('*').eq('is_active', true).order('display_order'),
         supabase.from('designations').select('*').eq('is_active', true).order('display_order'),
@@ -68,42 +67,79 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
       if (dedRes.data) setDeductions(dedRes.data as Deduction[])
       if (addRes.data) setAdditions(addRes.data as Addition[])
       if (incRes.data) setIncentives(incRes.data as Incentive[])
+    } catch (err) {
+      console.error('Error fetching reference data:', err)
+    }
+  }, [])
 
-      // Fetch employees
+  // Debounce search filter to avoid excessive API calls
+  const [debouncedFilters, setDebouncedFilters] = useState(filters)
+
+  useEffect(() => {
+    // For search, debounce 300ms; for other filters, apply immediately
+    // Note: We check all fields to ensure updates to other filters are immediate
+    if (filters.search !== debouncedFilters.search) {
+      const timer = setTimeout(() => {
+        setDebouncedFilters(filters)
+      }, 300)
+      return () => clearTimeout(timer)
+    } else {
+      setDebouncedFilters(filters)
+    }
+  }, [filters])
+
+  // Fetch employees and payroll data (runs on filter changes)
+  const fetchEmployees = useCallback(async () => {
+    try {
+      setLoading(true)
+      setError(null)
+
+      console.log('Fetching employees with filters:', debouncedFilters)
+
+      // Fetch employees with filters
       let employeeQuery = supabase.from('employees').select('*')
 
-      // Apply filters
-      if (filters.employmentStatus) {
-        employeeQuery = employeeQuery.eq('employment_status', filters.employmentStatus)
+      // Apply filters using DEBOUNCED values
+      if (debouncedFilters.employmentStatus) {
+        employeeQuery = employeeQuery.eq('employment_status', debouncedFilters.employmentStatus)
       }
-      if (filters.pfApplicable) {
-        employeeQuery = employeeQuery.eq('pf_applicable', filters.pfApplicable)
+      if (debouncedFilters.pfApplicable) {
+        employeeQuery = employeeQuery.eq('pf_applicable', debouncedFilters.pfApplicable)
       }
-      if (filters.esiApplicable) {
-        employeeQuery = employeeQuery.eq('esi_applicable', filters.esiApplicable)
+      if (debouncedFilters.esiApplicable) {
+        employeeQuery = employeeQuery.eq('esi_applicable', debouncedFilters.esiApplicable)
       }
-      if (filters.designation) {
-        employeeQuery = employeeQuery.eq('designation', filters.designation)
+      if (debouncedFilters.designation) {
+        employeeQuery = employeeQuery.eq('designation', debouncedFilters.designation)
       }
-      if (filters.department) {
-        employeeQuery = employeeQuery.eq('department', filters.department)
+      if (debouncedFilters.department) {
+        employeeQuery = employeeQuery.eq('department', debouncedFilters.department)
       }
-      if (filters.paymentMode) {
-        employeeQuery = employeeQuery.eq('payment_mode', filters.paymentMode)
+      if (debouncedFilters.paymentMode) {
+        employeeQuery = employeeQuery.eq('payment_mode', debouncedFilters.paymentMode)
+      }
+      // Apply isActive filter
+      if (debouncedFilters.isActive === 'active') {
+        employeeQuery = employeeQuery.eq('is_active', true)
+      } else if (debouncedFilters.isActive === 'deactivated') {
+        employeeQuery = employeeQuery.eq('is_active', false)
       }
 
-      const { data: employeesData, error: employeesError } = await employeeQuery.order('employee_id')
+      // Fetch employees and payroll in parallel
+      const [employeesResult, payrollResult] = await Promise.all([
+        employeeQuery.order('employee_id'),
+        supabase
+          .from('monthly_payroll')
+          .select('*')
+          .eq('month', month)
+          .eq('year', year)
+      ])
 
-      if (employeesError) throw employeesError
+      if (employeesResult.error) throw employeesResult.error
+      if (payrollResult.error) throw payrollResult.error
 
-      // Fetch payroll data for the month
-      const { data: payrollData, error: payrollError } = await supabase
-        .from('monthly_payroll')
-        .select('*')
-        .eq('month', month)
-        .eq('year', year)
-
-      if (payrollError) throw payrollError
+      const employeesData = employeesResult.data
+      const payrollData = payrollResult.data
 
       // Create a map of payroll data by employee_id
       const payrollMap = new Map<string, MonthlyPayroll>()
@@ -118,8 +154,8 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
       }))
 
       // Apply search filter
-      if (filters.search) {
-        const searchLower = filters.search.toLowerCase()
+      if (debouncedFilters.search) {
+        const searchLower = debouncedFilters.search.toLowerCase()
         combined = combined.filter(
           (emp) =>
             emp.employee_id.toLowerCase().includes(searchLower) ||
@@ -128,25 +164,25 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
       }
 
       // Apply payroll-specific filters
-      if (filters.deductionType) {
-        combined = combined.filter((emp) => emp.payroll?.deduction_type === filters.deductionType)
+      if (debouncedFilters.deductionType) {
+        combined = combined.filter((emp) => emp.payroll?.deduction_type === debouncedFilters.deductionType)
       }
-      if (filters.additionType) {
-        combined = combined.filter((emp) => emp.payroll?.addition_type === filters.additionType)
+      if (debouncedFilters.additionType) {
+        combined = combined.filter((emp) => emp.payroll?.addition_type === debouncedFilters.additionType)
       }
-      if (filters.incentiveType) {
-        combined = combined.filter((emp) => emp.payroll?.incentive_type === filters.incentiveType)
+      if (debouncedFilters.incentiveType) {
+        combined = combined.filter((emp) => emp.payroll?.incentive_type === debouncedFilters.incentiveType)
       }
-      if (filters.hrRemark) {
-        combined = combined.filter((emp) => emp.payroll?.hr_remark === filters.hrRemark)
+      if (debouncedFilters.hrRemark) {
+        combined = combined.filter((emp) => emp.payroll?.hr_remark === debouncedFilters.hrRemark)
       }
-      if (filters.salaryProcessingRequired) {
+      if (debouncedFilters.salaryProcessingRequired) {
         combined = combined.filter(
-          (emp) => emp.payroll?.salary_processing_required === filters.salaryProcessingRequired
+          (emp) => emp.payroll?.salary_processing_required === debouncedFilters.salaryProcessingRequired
         )
       }
-      if (filters.paymentStatus) {
-        combined = combined.filter((emp) => emp.payroll?.payment_status === filters.paymentStatus)
+      if (debouncedFilters.paymentStatus) {
+        combined = combined.filter((emp) => emp.payroll?.payment_status === debouncedFilters.paymentStatus)
       }
 
       setEmployees(combined)
@@ -155,8 +191,14 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
     } finally {
       setLoading(false)
     }
-  }, [month, year, filters])
+  }, [month, year, debouncedFilters])
 
+  // Fetch reference data once on mount
+  useEffect(() => {
+    fetchReferenceData()
+  }, [fetchReferenceData])
+
+  // Fetch employees when debounced filters change
   useEffect(() => {
     fetchEmployees()
   }, [fetchEmployees])
@@ -180,6 +222,7 @@ export function useEmployees({ month, year }: UseEmployeesOptions) {
       hrRemark: '',
       salaryProcessingRequired: '',
       paymentStatus: '',
+      isActive: 'active', // Reset to showing only active employees
     })
   }
 

@@ -1,10 +1,10 @@
 import { useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
-import type { 
-  MonthlyPayrollCycle, 
-  EmployeePayrollLock, 
+import type {
+  MonthlyPayrollCycle,
+  EmployeePayrollLock,
   PayrollLockStats,
-  PayrollLockRequirement 
+  PayrollLockRequirement
 } from '@/types/database'
 import { useAuth } from '@/contexts/AuthContext'
 
@@ -22,10 +22,10 @@ export function usePayrollFinalization() {
     // Can't access months before company start
     if (year < COMPANY_START_YEAR) return false
     if (year === COMPANY_START_YEAR && month < COMPANY_START_MONTH) return false
-    
+
     // October 2025 is always accessible (first month)
     if (year === COMPANY_START_YEAR && month === COMPANY_START_MONTH) return true
-    
+
     // For any other month, the previous month must be finalized
     let prevMonth = month - 1
     let prevYear = year
@@ -33,7 +33,7 @@ export function usePayrollFinalization() {
       prevMonth = 12
       prevYear -= 1
     }
-    
+
     // Check if previous month is finalized
     const { data: prevPayroll } = await supabase
       .from('monthly_payrolls')
@@ -41,7 +41,7 @@ export function usePayrollFinalization() {
       .eq('month', prevMonth)
       .eq('year', prevYear)
       .single()
-    
+
     // Previous month must exist and be finalized
     return !!(prevPayroll && (prevPayroll.finance_signoff_at || prevPayroll.status === 'finalized'))
   }, [])
@@ -220,8 +220,8 @@ export function usePayrollFinalization() {
 
   // Toggle HR lock for an employee
   const toggleHRLock = useCallback(async (
-    employeeId: string, 
-    payrollId: string, 
+    employeeId: string,
+    payrollId: string,
     currentlyLocked: boolean
   ) => {
     try {
@@ -292,8 +292,8 @@ export function usePayrollFinalization() {
 
   // Toggle Finance lock for an employee
   const toggleFinanceLock = useCallback(async (
-    employeeId: string, 
-    payrollId: string, 
+    employeeId: string,
+    payrollId: string,
     currentlyLocked: boolean
   ) => {
     try {
@@ -543,7 +543,7 @@ export function usePayrollFinalization() {
 
   // Update lock requirement
   const updateLockRequirement = useCallback(async (
-    fieldName: string, 
+    fieldName: string,
     requiredForHR: boolean,
     requiredForFinance: boolean
   ) => {
@@ -553,7 +553,7 @@ export function usePayrollFinalization() {
 
       const { error: updateError } = await supabase
         .from('payroll_lock_requirements')
-        .update({ 
+        .update({
           required_for_hr_lock: requiredForHR,
           required_for_finance_lock: requiredForFinance
         })
@@ -589,6 +589,184 @@ export function usePayrollFinalization() {
     }
   }, [])
 
+  // Bulk HR Lock - Lock or unlock all employees for HR
+  const bulkHRLock = useCallback(async (
+    payrollId: string,
+    employeeIds: string[],
+    lock: boolean
+  ): Promise<{ success: number; failed: number; skipped: number }> => {
+    try {
+      setLoading(true)
+      setError(null)
+
+      let success = 0
+      let failed = 0
+      let skipped = 0
+
+      for (const employeeId of employeeIds) {
+        try {
+          // If locking, validate first
+          if (lock) {
+            const validation = await validateHRLock(employeeId)
+            if (!validation.can_lock) {
+              skipped++
+              continue
+            }
+          }
+
+          // Check if lock record exists
+          const { data: existing } = await supabase
+            .from('employee_payroll_locks')
+            .select('*')
+            .eq('employee_id', employeeId)
+            .eq('payroll_id', payrollId)
+            .single()
+
+          if (existing) {
+            // Update existing lock
+            const { error: updateError } = await supabase
+              .from('employee_payroll_locks')
+              .update({
+                hr_locked: lock,
+                hr_locked_by: lock ? user?.id : null,
+                hr_locked_at: lock ? new Date().toISOString() : null
+              })
+              .eq('id', existing.id)
+
+            if (updateError) {
+              failed++
+              continue
+            }
+          } else if (lock) {
+            // Create new lock record only when locking
+            const { error: insertError } = await supabase
+              .from('employee_payroll_locks')
+              .insert({
+                employee_id: employeeId,
+                payroll_id: payrollId,
+                hr_locked: true,
+                hr_locked_by: user?.id,
+                hr_locked_at: new Date().toISOString()
+              })
+
+            if (insertError) {
+              failed++
+              continue
+            }
+          }
+
+          success++
+        } catch {
+          failed++
+        }
+      }
+
+      // Log bulk audit entry
+      await supabase.from('payroll_audit_log').insert({
+        payroll_id: payrollId,
+        action_type: lock ? 'bulk_hr_lock' : 'bulk_hr_unlock',
+        performed_by: user?.id,
+        details: { total: employeeIds.length, success, failed, skipped }
+      })
+
+      return { success, failed, skipped }
+    } catch (err: any) {
+      setError(err.message)
+      return { success: 0, failed: employeeIds.length, skipped: 0 }
+    } finally {
+      setLoading(false)
+    }
+  }, [user, validateHRLock])
+
+  // Bulk Finance Lock - Lock or unlock all employees for Finance
+  const bulkFinanceLock = useCallback(async (
+    payrollId: string,
+    employeeIds: string[],
+    lock: boolean
+  ): Promise<{ success: number; failed: number; skipped: number }> => {
+    try {
+      setLoading(true)
+      setError(null)
+
+      let success = 0
+      let failed = 0
+      let skipped = 0
+
+      for (const employeeId of employeeIds) {
+        try {
+          // If locking, validate first
+          if (lock) {
+            const validation = await validateFinanceLock(employeeId)
+            if (!validation.can_lock) {
+              skipped++
+              continue
+            }
+          }
+
+          // Check if lock record exists
+          const { data: existing } = await supabase
+            .from('employee_payroll_locks')
+            .select('*')
+            .eq('employee_id', employeeId)
+            .eq('payroll_id', payrollId)
+            .single()
+
+          if (existing) {
+            // Update existing lock
+            const { error: updateError } = await supabase
+              .from('employee_payroll_locks')
+              .update({
+                finance_locked: lock,
+                finance_locked_by: lock ? user?.id : null,
+                finance_locked_at: lock ? new Date().toISOString() : null
+              })
+              .eq('id', existing.id)
+
+            if (updateError) {
+              failed++
+              continue
+            }
+          } else if (lock) {
+            // Create new lock record only when locking
+            const { error: insertError } = await supabase
+              .from('employee_payroll_locks')
+              .insert({
+                employee_id: employeeId,
+                payroll_id: payrollId,
+                finance_locked: true,
+                finance_locked_by: user?.id,
+                finance_locked_at: new Date().toISOString()
+              })
+
+            if (insertError) {
+              failed++
+              continue
+            }
+          }
+
+          success++
+        } catch {
+          failed++
+        }
+      }
+
+      // Log bulk audit entry
+      await supabase.from('payroll_audit_log').insert({
+        payroll_id: payrollId,
+        action_type: lock ? 'bulk_finance_lock' : 'bulk_finance_unlock',
+        performed_by: user?.id,
+        details: { total: employeeIds.length, success, failed, skipped }
+      })
+
+      return { success, failed, skipped }
+    } catch (err: any) {
+      setError(err.message)
+      return { success: 0, failed: employeeIds.length, skipped: 0 }
+    } finally {
+      setLoading(false)
+    }
+  }, [user, validateFinanceLock])
+
   return {
     loading,
     error,
@@ -600,6 +778,8 @@ export function usePayrollFinalization() {
     validateFinanceLock,
     toggleHRLock,
     toggleFinanceLock,
+    bulkHRLock,
+    bulkFinanceLock,
     hrSignoff,
     financeSignoff,
     revertPayroll,

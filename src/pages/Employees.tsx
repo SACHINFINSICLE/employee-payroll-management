@@ -73,7 +73,7 @@ const paymentModeOptions = [
 export function Employees() {
   const { profile, isHR, isFinance } = useAuth()
   const { canEdit } = useFieldAccess()
-  
+
   // Use the payroll month hook for month progression logic
   const {
     selectedMonth: month,
@@ -114,9 +114,12 @@ export function Employees() {
   const [showFinanceSignoffModal, setShowFinanceSignoffModal] = useState(false)
   const [snapshotData, setSnapshotData] = useState<any[] | null>(null)
   const [isViewingSnapshot, setIsViewingSnapshot] = useState(false)
+  const [bulkLockLoading, setBulkLockLoading] = useState(false)
+  const [showBulkLockConfirm, setShowBulkLockConfirm] = useState(false)
+  const [bulkLockAction, setBulkLockAction] = useState<{ type: 'hr' | 'finance'; lock: boolean } | null>(null)
 
   const { employees: liveEmployees, loading, filters, updateFilter, clearFilters, refetch, designations, departments, deductions, additions, incentives } = useEmployees({ month, year })
-  
+
   // Use snapshot data if viewing finalized payroll, otherwise use live data
   const employees = isViewingSnapshot && snapshotData ? snapshotData : liveEmployees
 
@@ -128,15 +131,17 @@ export function Employees() {
     if (currentPayroll.hr_signoff_at) return 'hr_signed'
     return 'pending'
   }, [currentPayroll])
-  
-  const { 
-    getOrCreatePayrollCycle, 
-    getPayrollLockStats, 
+
+  const {
+    getOrCreatePayrollCycle,
+    getPayrollLockStats,
     getEmployeeLocks,
     validateHRLock,
     validateFinanceLock,
-    toggleHRLock, 
-    toggleFinanceLock 
+    toggleHRLock,
+    toggleFinanceLock,
+    bulkHRLock,
+    bulkFinanceLock
   } = usePayrollFinalization()
 
   const [newEmployee, setNewEmployee] = useState({ employee_id: '', employee_name: '', designation: '', department: '', joining_date: '', payment_mode: 'INR Account' as PaymentMode })
@@ -150,14 +155,14 @@ export function Employees() {
     try {
       console.log(`📅 Loading payroll data for ${month}/${year}`)
       const payroll = await getOrCreatePayrollCycle(month, year)
-      console.log('📊 Payroll loaded:', { 
-        id: payroll.id, 
-        status: payroll.status, 
-        hr_signoff_at: payroll.hr_signoff_at, 
-        finance_signoff_at: payroll.finance_signoff_at 
+      console.log('📊 Payroll loaded:', {
+        id: payroll.id,
+        status: payroll.status,
+        hr_signoff_at: payroll.hr_signoff_at,
+        finance_signoff_at: payroll.finance_signoff_at
       })
       setCurrentPayroll(payroll)
-      
+
       // Check if payroll is finalized and load snapshot data
       const isFinalized = !!payroll.finance_signoff_at
       if (isFinalized) {
@@ -170,7 +175,7 @@ export function Employees() {
           .eq('report_type', 'snapshot')
           .eq('is_finalized', true)
           .single()
-        
+
         if (reportError) {
           console.error('Error fetching snapshot:', reportError)
           setSnapshotData(null)
@@ -184,9 +189,8 @@ export function Employees() {
           console.log('📸 Snapshot data loaded:', snapshotCount, 'employees')
           setSnapshotData(snapshotEmployees)
           setIsViewingSnapshot(true)
-          
+
           // For finalized payrolls, use FROZEN lock stats from snapshot
-          // All employees were locked when finalized, so counts should match
           setLockStats({
             total_employees: snapshotCount,
             hr_locked_count: snapshotCount,
@@ -198,29 +202,33 @@ export function Employees() {
           console.log('⚠️ No snapshot data found for finalized payroll')
           setSnapshotData(null)
           setIsViewingSnapshot(false)
-          // Fallback to live stats
           const stats = await getPayrollLockStats(payroll.id)
           setLockStats(stats)
         }
-        
-        // For finalized payrolls, don't load live locks - they're frozen
+
+        // For finalized payrolls, don't load live locks
         setEmployeeLocks(new Map())
+        setEmployeeValidation(new Map())
       } else {
         // Not finalized, use live data
         setSnapshotData(null)
         setIsViewingSnapshot(false)
-        
-        // Load live lock stats for non-finalized payrolls
-        const stats = await getPayrollLockStats(payroll.id)
+
+        // Load lock stats and employee locks in PARALLEL for better performance
+        const [stats, locks] = await Promise.all([
+          getPayrollLockStats(payroll.id),
+          getEmployeeLocks(payroll.id)
+        ])
+
         console.log('🔒 Lock stats:', stats)
         setLockStats(stats)
-        
-        const locks = await getEmployeeLocks(payroll.id)
+
         const lockMap = new Map(locks.map(l => [l.employee_id, l]))
         setEmployeeLocks(lockMap)
-        
-        // Validate all employees for lock eligibility
-        await validateAllEmployees()
+
+        // Note: We skip validateAllEmployees on initial load for performance
+        // Validation will be done on-demand when user interacts with lock buttons
+        setEmployeeValidation(new Map())
       }
     } catch (error) {
       console.error('Error loading payroll data:', error)
@@ -229,16 +237,16 @@ export function Employees() {
 
   const validateAllEmployees = async () => {
     const validationMap = new Map()
-    
+
     for (const employee of employees) {
       const hrValidation = await validateHRLock(employee.id)
       const financeValidation = await validateFinanceLock(employee.id)
-      
+
       // Also check for type vs amount consistency
       const typeAmountErrors = validateTypeAmountConsistencyForEmployee(employee)
       const hasTypeAmountErrors = Object.keys(typeAmountErrors).length > 0
       const typeAmountMissingFields = Object.values(typeAmountErrors)
-      
+
       validationMap.set(employee.id, {
         canLockHR: hrValidation.can_lock && !hasTypeAmountErrors,
         canLockFinance: financeValidation.can_lock && !hasTypeAmountErrors,
@@ -246,45 +254,109 @@ export function Employees() {
         missingFinanceFields: [...financeValidation.missing_fields, ...typeAmountMissingFields]
       })
     }
-    
+
     setEmployeeValidation(validationMap)
   }
 
   // Validate type vs amount consistency for an employee (using saved data, not edit state)
   const validateTypeAmountConsistencyForEmployee = (emp: any): RowValidationError => {
     const errors: RowValidationError = {}
-    
+
     const deductionType = emp.payroll?.deduction_type
     const deductionAmount = Number(emp.payroll?.deduction_amount || 0)
     const additionType = emp.payroll?.addition_type
     const additionAmount = Number(emp.payroll?.addition_amount || 0)
     const incentiveType = emp.payroll?.incentive_type
     const incentiveAmount = Number(emp.payroll?.incentive_amount || 0)
-    
+
     // If deduction type is not 'Nil' and not empty, amount must be > 0
     if (deductionType && deductionType !== 'Nil' && deductionType !== '' && deductionAmount <= 0) {
       errors.deduction = `Deduction amount required for "${deductionType}"`
     }
-    
+
     // If addition type is not 'Nil' and not empty, amount must be > 0
     if (additionType && additionType !== 'Nil' && additionType !== '' && additionAmount <= 0) {
       errors.addition = `Addition amount required for "${additionType}"`
     }
-    
+
     // If incentive type is not 'Nil' and not empty, amount must be > 0
     if (incentiveType && incentiveType !== 'Nil' && incentiveType !== '' && incentiveAmount <= 0) {
       errors.incentive = `Incentive amount required for "${incentiveType}"`
     }
-    
+
     return errors
   }
 
+  // Filter snapshot data client-side when viewing a snapshot
+  const displayedEmployees = useMemo(() => {
+    if (isViewingSnapshot && snapshotData) {
+      let filtered = [...snapshotData]
+
+      // Apply filters client-side to snapshot data
+      if (filters.isActive === 'active') {
+        filtered = filtered.filter(emp => emp.is_active !== false) // Treat null/undefined as active for safety, or strict true
+      } else if (filters.isActive === 'deactivated') {
+        filtered = filtered.filter(emp => emp.is_active === false)
+      }
+
+      if (filters.employmentStatus) {
+        filtered = filtered.filter(emp => emp.employment_status === filters.employmentStatus)
+      }
+
+      if (filters.search) {
+        const searchLower = filters.search.toLowerCase()
+        filtered = filtered.filter(emp =>
+          (emp.employee_name && emp.employee_name.toLowerCase().includes(searchLower)) ||
+          (emp.employee_id && emp.employee_id.toLowerCase().includes(searchLower))
+        )
+      }
+
+      if (filters.pfApplicable) {
+        filtered = filtered.filter(emp => emp.pf_applicable === filters.pfApplicable)
+      }
+      if (filters.esiApplicable) {
+        filtered = filtered.filter(emp => emp.esi_applicable === filters.esiApplicable)
+      }
+      if (filters.designation) {
+        filtered = filtered.filter(emp => emp.designation === filters.designation)
+      }
+      if (filters.department) {
+        filtered = filtered.filter(emp => emp.department === filters.department)
+      }
+      if (filters.paymentMode) {
+        filtered = filtered.filter(emp => emp.payment_mode === filters.paymentMode)
+      }
+      if (filters.deductionType) {
+        filtered = filtered.filter(emp => emp.payroll?.deduction_type === filters.deductionType)
+      }
+      if (filters.additionType) {
+        filtered = filtered.filter(emp => emp.payroll?.addition_type === filters.additionType)
+      }
+      if (filters.incentiveType) {
+        filtered = filtered.filter(emp => emp.payroll?.incentive_type === filters.incentiveType)
+      }
+      if (filters.hrRemark) {
+        filtered = filtered.filter(emp => emp.payroll?.hr_remark === filters.hrRemark)
+      }
+      if (filters.salaryProcessingRequired) {
+        filtered = filtered.filter(emp => emp.payroll?.salary_processing_required === filters.salaryProcessingRequired)
+      }
+      if (filters.paymentStatus) {
+        filtered = filtered.filter(emp => emp.payroll?.payment_status === filters.paymentStatus)
+      }
+
+      return filtered
+    }
+
+    return employees
+  }, [isViewingSnapshot, snapshotData, employees, filters])
+
   const handleHRLockToggle = async (employeeId: string) => {
     if (!currentPayroll) return
-    
+
     const currentLock = employeeLocks.get(employeeId)
     const isLocked = currentLock?.hr_locked || false
-    
+
     const success = await toggleHRLock(employeeId, currentPayroll.id, isLocked)
     if (success) {
       await loadPayrollData()
@@ -293,10 +365,10 @@ export function Employees() {
 
   const handleFinanceLockToggle = async (employeeId: string) => {
     if (!currentPayroll) return
-    
+
     const currentLock = employeeLocks.get(employeeId)
     const isLocked = currentLock?.finance_locked || false
-    
+
     const success = await toggleFinanceLock(employeeId, currentPayroll.id, isLocked)
     if (success) {
       await loadPayrollData()
@@ -307,6 +379,56 @@ export function Employees() {
     await loadPayrollData()
     await refreshPayrollMonths() // Refresh payroll month progression after finalization
     refetch()
+  }
+
+  // Open bulk lock confirmation dialog
+  const openBulkLockConfirm = (type: 'hr' | 'finance', lock: boolean) => {
+    setBulkLockAction({ type, lock })
+    setShowBulkLockConfirm(true)
+  }
+
+  // Execute bulk lock after confirmation
+  const executeBulkLock = async () => {
+    if (!bulkLockAction || !currentPayroll) return
+
+    const employeeIds = employees.filter(emp => emp.is_active).map(emp => emp.id)
+    if (employeeIds.length === 0) {
+      alert('No active employees to lock/unlock')
+      setShowBulkLockConfirm(false)
+      setBulkLockAction(null)
+      return
+    }
+
+    setShowBulkLockConfirm(false)
+    setBulkLockLoading(true)
+
+    try {
+      let result
+      if (bulkLockAction.type === 'hr') {
+        result = await bulkHRLock(currentPayroll.id, employeeIds, bulkLockAction.lock)
+      } else {
+        result = await bulkFinanceLock(currentPayroll.id, employeeIds, bulkLockAction.lock)
+      }
+      await loadPayrollData()
+
+      const roleLabel = bulkLockAction.type === 'hr' ? 'HR' : 'Finance'
+      const message = bulkLockAction.lock
+        ? `${roleLabel} Lock completed: ${result.success} locked, ${result.skipped} skipped (validation failed), ${result.failed} failed`
+        : `${roleLabel} Unlock completed: ${result.success} unlocked, ${result.failed} failed`
+      alert(message)
+    } catch (error) {
+      console.error('Bulk lock error:', error)
+      alert('Failed to perform bulk lock operation')
+    } finally {
+      setBulkLockLoading(false)
+      setBulkLockAction(null)
+    }
+  }
+
+  // Cancel bulk lock confirmation
+  const cancelBulkLockConfirm = () => {
+    setShowBulkLockConfirm(false)
+    setBulkLockAction(null)
   }
 
   // Real-time employee ID validation
@@ -361,18 +483,18 @@ export function Employees() {
 
   const checkPayrollComplete = () => {
     if (employees.length === 0) return false
-    
+
     // Check if all employees have payroll records with required fields filled
     return employees.every(emp => {
       if (!emp.payroll) return false
-      
+
       // Check required fields are not null/empty
       const hasBasicInfo = emp.employee_id && emp.employee_name && emp.employment_status
       const hasPayrollInfo = emp.payroll.employee_salary > 0
       const hasDeduction = emp.payroll.deduction_type !== null && emp.payroll.deduction_type !== undefined
       const hasAddition = emp.payroll.addition_type !== null && emp.payroll.addition_type !== undefined
       const hasHrRemark = emp.payroll.hr_remark !== null && emp.payroll.hr_remark !== undefined
-      
+
       return hasBasicInfo && hasPayrollInfo && hasDeduction && hasAddition && hasHrRemark
     })
   }
@@ -436,29 +558,29 @@ export function Employees() {
   // Validate deduction/addition/incentive type vs amount consistency
   const validateTypeAmountConsistency = (emp: any): RowValidationError => {
     const errors: RowValidationError = {}
-    
+
     const deductionType = getFieldValue(emp, 'deduction_type', true)
     const deductionAmount = Number(getFieldValue(emp, 'deduction_amount', true) || 0)
     const additionType = getFieldValue(emp, 'addition_type', true)
     const additionAmount = Number(getFieldValue(emp, 'addition_amount', true) || 0)
     const incentiveType = getFieldValue(emp, 'incentive_type', true)
     const incentiveAmount = Number(getFieldValue(emp, 'incentive_amount', true) || 0)
-    
+
     // If deduction type is not 'Nil' and not empty, amount must be > 0
     if (deductionType && deductionType !== 'Nil' && deductionType !== '' && deductionAmount <= 0) {
       errors.deduction = `Deduction amount must be greater than 0 when "${deductionType}" is selected`
     }
-    
+
     // If addition type is not 'Nil' and not empty, amount must be > 0
     if (additionType && additionType !== 'Nil' && additionType !== '' && additionAmount <= 0) {
       errors.addition = `Addition amount must be greater than 0 when "${additionType}" is selected`
     }
-    
+
     // If incentive type is not 'Nil' and not empty, amount must be > 0
     if (incentiveType && incentiveType !== 'Nil' && incentiveType !== '' && incentiveAmount <= 0) {
       errors.incentive = `Incentive amount must be greater than 0 when "${incentiveType}" is selected`
     }
-    
+
     return errors
   }
 
@@ -492,7 +614,7 @@ export function Employees() {
 
     try {
       setSavingRows((prev) => new Set(prev).add(emp.id))
-      
+
       // Update employee fields if changed
       if (Object.keys(editState.employee).length > 0) {
         console.log('Updating employee fields:', editState.employee)
@@ -500,11 +622,11 @@ export function Employees() {
         if (error) throw error
         console.log('Employee update successful:', data)
       }
-      
+
       // Update or create payroll fields if changed
       const hasPayrollChanges = Object.keys(editState.payroll).length > 0
       const needsPayrollRecord = !emp.payroll?.id
-      
+
       if (hasPayrollChanges || needsPayrollRecord) {
         if (emp.payroll?.id) {
           // Update existing payroll record
@@ -540,14 +662,14 @@ export function Employees() {
           console.log('Payroll insert successful:', data)
         }
       }
-      
+
       // Clear edit state and refresh
       setEditStates((prev) => {
         const newState = { ...prev }
         delete newState[emp.id]
         return newState
       })
-      
+
       console.log('Refreshing data...')
       refetch()
       console.log('Save completed successfully')
@@ -576,7 +698,7 @@ export function Employees() {
 
     try {
       setTogglingEmployeeId(employeeToToggle.id)
-      
+
       // Toggle employee active status (soft delete)
       const newStatus = !employeeToToggle.is_active
       const { error } = await supabase
@@ -592,7 +714,7 @@ export function Employees() {
       setShowDeactivateDialog(false)
       setEmployeeToToggle(null)
       await refetch()
-      
+
       const action = newStatus ? 'activated' : 'deactivated'
       alert(`Employee ${employeeToToggle.employee_id} - ${employeeToToggle.name} has been ${action} successfully.`)
     } catch (error: any) {
@@ -618,10 +740,10 @@ export function Employees() {
       alert('Cannot sign off: Some employees have incomplete payroll information')
       return
     }
-    
+
     try {
       setSaving(true)
-      
+
       if (payrollSignOff) {
         // Update existing sign-off
         await supabase
@@ -646,7 +768,7 @@ export function Employees() {
             is_complete: true
           })
       }
-      
+
       setShowSignOffDialog(false)
       setSignOffRemarks('')
       await fetchPayrollSignOff()
@@ -661,16 +783,16 @@ export function Employees() {
 
   const handleCancelHRSignOff = async () => {
     if (!payrollSignOff?.hr_signoff_at) return
-    
+
     // Check if the current user is the one who signed off
     if (payrollSignOff.hr_signoff_by !== profile?.id) {
       alert('Only the person who signed off can cancel the signoff')
       return
     }
-    
+
     try {
       setSaving(true)
-      
+
       await supabase
         .from('payroll_signoffs')
         .update({
@@ -679,7 +801,7 @@ export function Employees() {
           remarks: signOffRemarks ? `[HR CANCELLED] ${signOffRemarks}\n${payrollSignOff.remarks || ''}` : payrollSignOff.remarks
         })
         .eq('id', payrollSignOff.id)
-      
+
       setShowSignOffDialog(false)
       setSignOffRemarks('')
       await fetchPayrollSignOff()
@@ -695,7 +817,7 @@ export function Employees() {
   const generateFinalizedReport = async () => {
     try {
       console.log('🔄 Starting report generation for', getMonthName(month), year)
-      
+
       // Fetch all employees with their payroll data for this month
       const employeesWithPayroll = employees.map(emp => ({
         ...emp,
@@ -747,10 +869,10 @@ export function Employees() {
       alert('HR must sign off first')
       return
     }
-    
+
     try {
       setSaving(true)
-      
+
       if (approve) {
         // Approve payroll
         await supabase
@@ -761,7 +883,7 @@ export function Employees() {
             remarks: signOffRemarks || payrollSignOff.remarks
           })
           .eq('id', payrollSignOff.id)
-        
+
         // Auto-generate finalized report
         await generateFinalizedReport()
       } else {
@@ -771,7 +893,7 @@ export function Employees() {
           setSaving(false)
           return
         }
-        
+
         await supabase
           .from('payroll_signoffs')
           .update({
@@ -781,7 +903,7 @@ export function Employees() {
           })
           .eq('id', payrollSignOff.id)
       }
-      
+
       setShowSignOffDialog(false)
       setSignOffRemarks('')
       setIsRejecting(false)
@@ -806,15 +928,15 @@ export function Employees() {
         </div>
         <div className="flex items-center gap-3">
           {(isFinance || isHR) && (
-            <Button 
-              variant="outline" 
+            <Button
+              variant="outline"
               onClick={generateFinalizedReport}
               disabled={actualPayrollStatus !== 'finalized'}
               className={actualPayrollStatus === 'finalized'
-                ? "bg-purple-50 text-purple-700 hover:bg-purple-100" 
+                ? "bg-purple-50 text-purple-700 hover:bg-purple-100"
                 : "bg-gray-100 text-gray-400 cursor-not-allowed"}
               title={actualPayrollStatus === 'finalized'
-                ? "Generate report for finalized payroll" 
+                ? "Generate report for finalized payroll"
                 : "Payroll must be Finance-approved first"}
             >
               📊 Generate Report
@@ -848,8 +970,8 @@ export function Employees() {
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span>
-                      <Button 
-                        onClick={() => setShowAddEmployee(true)} 
+                      <Button
+                        onClick={() => setShowAddEmployee(true)}
                         disabled={isPayrollLocked}
                         className={isPayrollLocked ? 'opacity-50 cursor-not-allowed' : ''}
                       >
@@ -866,8 +988,8 @@ export function Employees() {
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span>
-                      <Button 
-                        variant="outline" 
+                      <Button
+                        variant="outline"
                         onClick={() => setShowBulkUpload(true)}
                         disabled={isPayrollLocked}
                         className={isPayrollLocked ? 'opacity-50 cursor-not-allowed' : ''}
@@ -887,6 +1009,7 @@ export function Employees() {
           </div>
           {showFilters && (
             <div className="mt-4 pt-4 border-t grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+              <Select value={filters.isActive} onChange={(e) => updateFilter('isActive', e.target.value)} options={[{ value: '', label: 'All (Active + Deactivated)' }, { value: 'active', label: 'Active Only' }, { value: 'deactivated', label: 'Deactivated Only' }]} />
               <Select value={filters.employmentStatus} onChange={(e) => updateFilter('employmentStatus', e.target.value)} options={employmentStatusOptions} />
               <Select value={filters.designation} onChange={(e) => updateFilter('designation', e.target.value)} options={[{ value: '', label: 'All Designation' }, ...designations.map((d) => ({ value: d.name, label: d.name }))]} />
               <Select value={filters.department} onChange={(e) => updateFilter('department', e.target.value)} options={[{ value: '', label: 'All Department' }, ...departments.map((d) => ({ value: d.name, label: d.name }))]} />
@@ -915,13 +1038,13 @@ export function Employees() {
                 <span className="text-sm text-slate-600">Payroll Status:</span>
                 {currentPayroll && (
                   <Badge variant={
-                    actualPayrollStatus === 'finalized' ? 'default' : 
-                    actualPayrollStatus === 'hr_signed' ? 'secondary' : 
-                    'outline'
+                    actualPayrollStatus === 'finalized' ? 'default' :
+                      actualPayrollStatus === 'hr_signed' ? 'secondary' :
+                        'outline'
                   }>
                     {actualPayrollStatus === 'finalized' ? '🟢 Finalized' :
-                     actualPayrollStatus === 'hr_signed' ? '🔵 HR Signed' :
-                     '🟡 Pending'}
+                      actualPayrollStatus === 'hr_signed' ? '🔵 HR Signed' :
+                        '🟡 Pending'}
                   </Badge>
                 )}
               </div>
@@ -931,17 +1054,72 @@ export function Employees() {
                 <span className="text-slate-600">HR Locks:</span>
                 <span className="font-semibold">{lockStats?.hr_locked_count || 0}/{lockStats?.total_employees || 0}</span>
               </div>
-              
+
               <div className="flex items-center gap-1 text-sm">
                 <span className="text-slate-600">Finance Locks:</span>
                 <span className="font-semibold">{lockStats?.finance_locked_count || 0}/{lockStats?.total_employees || 0}</span>
               </div>
             </div>
 
-            {/* Sign-off Buttons */}
-            <div className="flex gap-2">
+            {/* Bulk Lock Buttons and Sign-off Buttons */}
+            <div className="flex flex-wrap gap-2">
+              {/* HR Bulk Lock Buttons */}
               {isHR && actualPayrollStatus === 'pending' && (
-                <Button 
+                <>
+                  {(lockStats?.hr_locked_count || 0) < (lockStats?.total_employees || 0) ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openBulkLockConfirm('hr', true)}
+                      disabled={bulkLockLoading}
+                    >
+                      <Lock className="mr-2 h-4 w-4" />
+                      {bulkLockLoading ? 'Locking...' : 'Lock All (HR)'}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openBulkLockConfirm('hr', false)}
+                      disabled={bulkLockLoading}
+                    >
+                      <Lock className="mr-2 h-4 w-4" />
+                      {bulkLockLoading ? 'Unlocking...' : 'Unlock All (HR)'}
+                    </Button>
+                  )}
+                </>
+              )}
+
+              {/* Finance Bulk Lock Buttons */}
+              {isFinance && actualPayrollStatus === 'hr_signed' && (
+                <>
+                  {(lockStats?.finance_locked_count || 0) < (lockStats?.total_employees || 0) ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openBulkLockConfirm('finance', true)}
+                      disabled={bulkLockLoading}
+                    >
+                      <Lock className="mr-2 h-4 w-4" />
+                      {bulkLockLoading ? 'Locking...' : 'Lock All (Finance)'}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openBulkLockConfirm('finance', false)}
+                      disabled={bulkLockLoading}
+                    >
+                      <Lock className="mr-2 h-4 w-4" />
+                      {bulkLockLoading ? 'Unlocking...' : 'Unlock All (Finance)'}
+                    </Button>
+                  )}
+                </>
+              )}
+
+              {/* HR Sign-off Button */}
+              {isHR && actualPayrollStatus === 'pending' && (
+                <Button
                   onClick={() => setShowHRSignoffModal(true)}
                   disabled={!lockStats?.can_hr_signoff}
                   title={!lockStats?.can_hr_signoff ? 'Lock all employees before signing off' : ''}
@@ -951,9 +1129,10 @@ export function Employees() {
                   HR Sign Off
                 </Button>
               )}
-              
+
+              {/* Finance Sign-off Button */}
               {isFinance && actualPayrollStatus === 'hr_signed' && (
-                <Button 
+                <Button
                   onClick={() => setShowFinanceSignoffModal(true)}
                   disabled={!lockStats?.can_finance_signoff}
                   title={!lockStats?.can_finance_signoff ? 'Lock all employees before signing off' : ''}
@@ -984,7 +1163,7 @@ export function Employees() {
               <div className="flex-1">
                 <h3 className="font-medium text-amber-900">Viewing Finalized Payroll Snapshot</h3>
                 <p className="text-sm text-amber-700">
-                  This is an immutable snapshot from when the payroll was finalized on {currentPayroll?.finance_signoff_at ? new Date(currentPayroll.finance_signoff_at).toLocaleDateString() : 'N/A'}. 
+                  This is an immutable snapshot from when the payroll was finalized on {currentPayroll?.finance_signoff_at ? new Date(currentPayroll.finance_signoff_at).toLocaleDateString() : 'N/A'}.
                   All data is read-only and reflects the exact state at finalization time.
                 </p>
               </div>
@@ -995,9 +1174,9 @@ export function Employees() {
       )}
 
       <Card>
-        <CardHeader><CardTitle>Employees ({employees.length}){isViewingSnapshot && <Badge variant="outline" className="ml-2 bg-amber-100 text-amber-800">Snapshot</Badge>}</CardTitle></CardHeader>
+        <CardHeader><CardTitle>Employees ({displayedEmployees.length}){isViewingSnapshot && <Badge variant="outline" className="ml-2 bg-amber-100 text-amber-800">Snapshot</Badge>}</CardTitle></CardHeader>
         <CardContent className="p-0">
-          {loading ? <div className="p-8 text-center">Loading...</div> : employees.length === 0 ? <div className="p-8 text-center text-slate-500">No employees found</div> : (
+          {loading ? <div className="p-8 text-center">Loading...</div> : displayedEmployees.length === 0 ? <div className="p-8 text-center text-slate-500">No employees found</div> : (
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
@@ -1060,30 +1239,30 @@ export function Employees() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {employees.map((emp) => {
+                  {displayedEmployees.map((emp) => {
                     const hrSigned = !!payrollSignOff?.hr_signoff_at
                     const finSigned = !!payrollSignOff?.finance_signoff_at
                     const isDirty = editStates[emp.id]?.isDirty
                     const isSaving = savingRows.has(emp.id)
                     // Employee can be edited only if: not payroll locked, user has permission, AND employee is active
                     const canEditRow = !isPayrollLocked && (isHR || isFinance) && emp.is_active
-                    
+
                     // Check individual employee locks
                     const employeeLock = employeeLocks.get(emp.id)
                     const isHRLocked = employeeLock?.hr_locked || false
                     const isFinanceLocked = employeeLock?.finance_locked || false
-                    
+
                     return (
                       <TableRow key={emp.id} className={`${isDirty ? 'bg-yellow-50' : ''} ${!emp.is_active ? 'bg-gray-100 opacity-60' : ''}`}>
                         <TableCell className="font-mono text-sm px-4">{emp.employee_id}</TableCell>
                         <TableCell className="font-medium px-4">{emp.employee_name}</TableCell>
                         <TableCell className="px-4">
                           {canEdit('employment_status', hrSigned, finSigned, isHRLocked, isFinanceLocked) && canEditRow ? (
-                            <Select 
-                              value={String(getFieldValue(emp, 'employment_status', false))} 
-                              onChange={(e) => updateRowField(emp.id, 'employment_status', e.target.value, false)} 
-                              options={employmentStatusOptions.slice(1)} 
-                              className="w-32" 
+                            <Select
+                              value={String(getFieldValue(emp, 'employment_status', false))}
+                              onChange={(e) => updateRowField(emp.id, 'employment_status', e.target.value, false)}
+                              options={employmentStatusOptions.slice(1)}
+                              className="w-32"
                             />
                           ) : (
                             <Badge variant="outline">{emp.employment_status}</Badge>
@@ -1139,12 +1318,12 @@ export function Employees() {
                         </TableCell>
                         <TableCell className="px-4">
                           {canEdit('current_salary', hrSigned, finSigned, isHRLocked, isFinanceLocked) && canEditRow ? (
-                            <Input 
+                            <Input
                               type="text"
                               inputMode="numeric"
-                              value={String(getFieldValue(emp, 'current_salary', false) || 0)} 
-                              onChange={(e) => updateRowField(emp.id, 'current_salary', Number(e.target.value.replace(/[^0-9]/g, '')), false)} 
-                              className="w-28" 
+                              value={String(getFieldValue(emp, 'current_salary', false) || 0)}
+                              onChange={(e) => updateRowField(emp.id, 'current_salary', Number(e.target.value.replace(/[^0-9]/g, '')), false)}
+                              className="w-28"
                             />
                           ) : (
                             formatCurrency(emp.current_salary)
@@ -1400,11 +1579,11 @@ export function Employees() {
                         <TableCell className="font-semibold">{formatCurrency(emp.payroll?.net_pay || 0)}</TableCell>
                         <TableCell className="px-4">
                           {canEdit('hr_remark', hrSigned, finSigned, isHRLocked, isFinanceLocked) && canEditRow ? (
-                            <Select 
-                              value={String(getFieldValue(emp, 'hr_remark', true) || 'Nil')} 
-                              onChange={(e) => updateRowField(emp.id, 'hr_remark', e.target.value, true)} 
-                              options={hrRemarkOptions.slice(1)} 
-                              className="w-36" 
+                            <Select
+                              value={String(getFieldValue(emp, 'hr_remark', true) || 'Nil')}
+                              onChange={(e) => updateRowField(emp.id, 'hr_remark', e.target.value, true)}
+                              options={hrRemarkOptions.slice(1)}
+                              className="w-36"
                             />
                           ) : (
                             emp.payroll?.hr_remark || '-'
@@ -1412,11 +1591,11 @@ export function Employees() {
                         </TableCell>
                         <TableCell className="px-4">
                           {canEdit('payment_status', hrSigned, finSigned, isHRLocked, isFinanceLocked) && canEditRow ? (
-                            <Select 
-                              value={String(getFieldValue(emp, 'payment_status', true) || 'Nil')} 
-                              onChange={(e) => updateRowField(emp.id, 'payment_status', e.target.value, true)} 
-                              options={paymentStatusOptions.slice(1)} 
-                              className="w-28" 
+                            <Select
+                              value={String(getFieldValue(emp, 'payment_status', true) || 'Nil')}
+                              onChange={(e) => updateRowField(emp.id, 'payment_status', e.target.value, true)}
+                              options={paymentStatusOptions.slice(1)}
+                              className="w-28"
                             />
                           ) : (
                             <Badge variant={emp.payroll?.payment_status === 'Paid' ? 'success' : 'secondary'}>
@@ -1450,7 +1629,7 @@ export function Employees() {
                                 missingFields={employeeValidation.get(emp.id)?.missingHRFields ?? []}
                               />
                             )}
-                            
+
                             {/* Finance Lock Icon */}
                             {isFinance && currentPayroll?.status === 'hr_signed' && (
                               <PayrollLockIcon
@@ -1462,7 +1641,7 @@ export function Employees() {
                                 missingFields={employeeValidation.get(emp.id)?.missingFinanceFields ?? []}
                               />
                             )}
-                            
+
                             {isDirty && canEditRow && (
                               <>
                                 <TooltipProvider>
@@ -1527,8 +1706,8 @@ export function Employees() {
           <div className="space-y-4 py-4">
             <div>
               <Label>Employee ID *</Label>
-              <Input 
-                value={newEmployee.employee_id} 
+              <Input
+                value={newEmployee.employee_id}
                 onChange={(e) => setNewEmployee({ ...newEmployee, employee_id: e.target.value })}
                 className={employeeIdExists ? 'border-red-500' : ''}
               />
@@ -1610,8 +1789,8 @@ export function Employees() {
           </DialogHeader>
           <div className="py-4">
             <p className="text-sm text-slate-600 mb-4">
-              {employeeToToggle?.is_active 
-                ? 'Are you sure you want to deactivate this employee?' 
+              {employeeToToggle?.is_active
+                ? 'Are you sure you want to deactivate this employee?'
                 : 'Are you sure you want to activate this employee?'}
             </p>
             {employeeToToggle && (
@@ -1657,9 +1836,9 @@ export function Employees() {
             <Button variant="outline" onClick={() => { setShowDeactivateDialog(false); setEmployeeToToggle(null) }}>
               Cancel
             </Button>
-            <Button 
+            <Button
               variant={employeeToToggle?.is_active ? 'destructive' : 'default'}
-              onClick={handleToggleEmployeeStatus} 
+              onClick={handleToggleEmployeeStatus}
               disabled={togglingEmployeeId !== null}
             >
               {togglingEmployeeId ? 'Processing...' : employeeToToggle?.is_active ? 'Deactivate' : 'Activate'}
@@ -1689,6 +1868,37 @@ export function Employees() {
         payrollId={currentPayroll?.id || ''}
         lockStats={lockStats}
       />
+
+      {/* Bulk Lock Confirmation Dialog */}
+      <Dialog open={showBulkLockConfirm} onOpenChange={(open) => !open && cancelBulkLockConfirm()}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {bulkLockAction?.lock ? 'Lock' : 'Unlock'} All Employees ({bulkLockAction?.type?.toUpperCase()})
+            </DialogTitle>
+          </DialogHeader>
+          <div className="py-4">
+            <p className="text-slate-600">
+              Are you sure you want to <strong>{bulkLockAction?.lock ? 'lock' : 'unlock'}</strong> all{' '}
+              <strong>{employees.filter(emp => emp.is_active).length}</strong> active employees for{' '}
+              <strong>{bulkLockAction?.type?.toUpperCase()}</strong>?
+            </p>
+            {bulkLockAction?.lock && (
+              <p className="mt-2 text-sm text-amber-600">
+                Note: Employees that don't meet validation requirements will be skipped.
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={cancelBulkLockConfirm}>
+              Cancel
+            </Button>
+            <Button onClick={executeBulkLock}>
+              {bulkLockAction?.lock ? 'Lock All' : 'Unlock All'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
