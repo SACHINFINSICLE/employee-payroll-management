@@ -15,6 +15,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Search, Filter, Plus, Upload, CheckCircle, X, Save, Power, Lock, AlertTriangle, Info } from 'lucide-react'
 import { MonthNavigator } from '@/components/MonthNavigator'
 import { formatCurrency, getMonthName } from '@/lib/utils'
+import * as XLSX from 'xlsx'
 // Department and Designation types used by useEmployees hook return values
 import type { Employee, MonthlyPayroll, EmploymentStatus, YesNo, PaymentMode, PayrollSignOff, MonthlyPayrollCycle, EmployeePayrollLock, PayrollLockStats } from '@/types/database'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
@@ -381,6 +382,11 @@ export function Employees() {
     await loadPayrollData()
     await refreshPayrollMonths() // Refresh payroll month progression after finalization
     refetch()
+  }
+
+  const handleFinanceSignoffSuccess = async () => {
+    await handleSignoffSuccess() // Load fresh data first
+    await generateFinalizedReport() // Auto-generate the snapshot report
   }
 
   // Open bulk lock confirmation dialog
@@ -820,11 +826,14 @@ export function Employees() {
     try {
       console.log('🔄 Starting report generation for', getMonthName(month), year)
 
-      // Fetch all employees with their payroll data for this month
-      const employeesWithPayroll = employees.map(emp => ({
-        ...emp,
-        payroll: emp.payroll
-      }))
+      // Fetch all ACTIVE employees with their payroll data for this month
+      // Filter out inactive employees to match the signoff scope (240 vs 246)
+      const employeesWithPayroll = employees
+        .filter(emp => emp.is_active)
+        .map(emp => ({
+          ...emp,
+          payroll: emp.payroll
+        }))
 
       console.log('📊 Employees with payroll:', employeesWithPayroll.length)
 
@@ -919,6 +928,103 @@ export function Employees() {
     }
   }
 
+  // Export Raw Data to Excel (Admin Only)
+  const handleExportRawExcel = () => {
+    if (profile?.role !== 'admin') return
+
+    try {
+      // Flatten data for export
+      const exportData = employees.map(emp => ({
+        'Employee ID': emp.employee_id,
+        'Name': emp.employee_name,
+        'Status': emp.employment_status,
+        'Designation': emp.designation,
+        'Department': emp.department,
+        'Joining Date': emp.joining_date,
+        'End Date': emp.end_date,
+        'Basic Salary': emp.current_salary,
+        'PF Applicable': emp.pf_applicable,
+        'ESI Applicable': emp.esi_applicable,
+        'Bank Account': emp.bank_account_number,
+        'Bank Name': emp.bank_name,
+        'IFSC': emp.bank_ifsc_code,
+        'Payment Mode': emp.payment_mode,
+        // Payroll Data
+        'Deduction Type': emp.payroll?.deduction_type || '',
+        'Deduction Amount': emp.payroll?.deduction_amount || 0,
+        'Addition Type': emp.payroll?.addition_type || '',
+        'Addition Amount': emp.payroll?.addition_amount || 0,
+        'Incentive Type': emp.payroll?.incentive_type || '',
+        'Incentive Amount': emp.payroll?.incentive_amount || 0,
+        'PF Amount': emp.payroll?.pf_amount || 0,
+        'ESI Amount': emp.payroll?.esi_amount || 0,
+        'Net Pay': emp.payroll?.net_pay || 0,
+        'HR Remark': emp.payroll?.hr_remark || '',
+        'Payment Status': emp.payroll?.payment_status || '',
+        'General Remarks': emp.payroll?.remarks || ''
+      }))
+
+      const worksheet = XLSX.utils.json_to_sheet(exportData)
+      const workbook = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Raw Data')
+
+      const fileName = `Payroll_Raw_Data_${getMonthName(month)}_${year}.xlsx`
+      XLSX.writeFile(workbook, fileName)
+
+      alert(`Successfully exported ${exportData.length} records to ${fileName}`)
+    } catch (error) {
+      console.error('Export failed:', error)
+      alert('Failed to export data. Please check console for details.')
+    }
+  }
+
+  // Bulk Save All Changes
+  const handleBulkSave = async () => {
+    const dirtyEmployeeIds = Object.keys(editStates).filter(id => editStates[id].isDirty)
+    if (dirtyEmployeeIds.length === 0) return
+
+    if (!confirm(`Are you sure you want to save changes for ${dirtyEmployeeIds.length} employees? This will verify and calculate Net Pay for all.`)) {
+      return
+    }
+
+    setSaving(true)
+    let savedCount = 0
+    let errorCount = 0
+
+    try {
+      for (const empId of dirtyEmployeeIds) {
+        const emp = employees.find(e => e.id === empId)
+        if (!emp) continue
+
+        const errors = validateTypeAmountConsistency(emp)
+        if (Object.keys(errors).length > 0) {
+          console.warn(`Skipping save for ${emp.employee_id} due to validation errors`)
+          errorCount++
+          continue
+        }
+
+        try {
+          await saveRow(emp)
+          savedCount++
+        } catch (err) {
+          console.error(`Failed to save ${emp.employee_id}`, err)
+          errorCount++
+        }
+      }
+
+      alert(`Bulk Save Completed!\nSuccessfully saved: ${savedCount}\nFailed/Skipped: ${errorCount}`)
+
+      if (savedCount > 0) {
+        refetch()
+      }
+    } catch (error) {
+      console.error('Bulk save fatal error:', error)
+      alert('An unexpected error occurred during bulk save.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const isPayrollLocked = actualPayrollStatus === 'finalized'
 
   return (
@@ -967,47 +1073,73 @@ export function Employees() {
               <Input placeholder="Search..." value={filters.search} onChange={(e) => updateFilter('search', e.target.value)} className="pl-10" />
             </div>
             <Button variant={showFilters ? 'default' : 'outline'} onClick={() => setShowFilters(!showFilters)}><Filter className="mr-2 h-4 w-4" />Filters</Button>
-            {isHR && (
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <Button
-                        onClick={() => setShowAddEmployee(true)}
-                        disabled={isPayrollLocked}
-                        className={isPayrollLocked ? 'opacity-50 cursor-not-allowed' : ''}
-                      >
-                        <Plus className="mr-2 h-4 w-4" />Add
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  {isPayrollLocked && (
-                    <TooltipContent>
-                      <p>Cannot add employees to a finalized payroll month</p>
-                    </TooltipContent>
-                  )}
-                </Tooltip>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <Button
-                        variant="outline"
-                        onClick={() => setShowBulkUpload(true)}
-                        disabled={isPayrollLocked}
-                        className={isPayrollLocked ? 'opacity-50 cursor-not-allowed' : ''}
-                      >
-                        <Upload className="mr-2 h-4 w-4" />Upload
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  {isPayrollLocked && (
-                    <TooltipContent>
-                      <p>Cannot upload employees to a finalized payroll month</p>
-                    </TooltipContent>
-                  )}
-                </Tooltip>
-              </TooltipProvider>
-            )}
+            {/* Actions */}
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Bulk Save Button - Visible only when there are unsaved changes */}
+              {Object.keys(editStates).some(k => editStates[k].isDirty) && (
+                <Button
+                  onClick={handleBulkSave}
+                  disabled={saving}
+                  className="mr-2 bg-green-600 hover:bg-green-700 text-white"
+                >
+                  <Save className="mr-2 h-4 w-4" />
+                  {saving ? 'Saving All...' : `Save All (${Object.keys(editStates).filter(k => editStates[k].isDirty).length})`}
+                </Button>
+              )}
+
+              {profile?.role === 'admin' && (
+                <Button
+                  variant="outline"
+                  onClick={handleExportRawExcel}
+                  className="mr-2"
+                >
+                  <Save className="mr-2 h-4 w-4" />
+                  Export Raw Data
+                </Button>
+              )}
+
+              {isHR && (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span>
+                        <Button
+                          onClick={() => setShowAddEmployee(true)}
+                          disabled={isPayrollLocked}
+                          className={isPayrollLocked ? 'opacity-50 cursor-not-allowed' : ''}
+                        >
+                          <Plus className="mr-2 h-4 w-4" />Add
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    {isPayrollLocked && (
+                      <TooltipContent>
+                        <p>Cannot add employees to a finalized payroll month</p>
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span>
+                        <Button
+                          variant="outline"
+                          onClick={() => setShowBulkUpload(true)}
+                          disabled={isPayrollLocked}
+                          className={isPayrollLocked ? 'opacity-50 cursor-not-allowed' : ''}
+                        >
+                          <Upload className="mr-2 h-4 w-4" />Upload
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    {isPayrollLocked && (
+                      <TooltipContent>
+                        <p>Cannot upload employees to a finalized payroll month</p>
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                </TooltipProvider>
+              )}
+            </div>
           </div>
           {showFilters && (
             <div className="mt-4 pt-4 border-t grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
@@ -1032,6 +1164,15 @@ export function Employees() {
       {/* Payroll Finalization Status */}
       <Card>
         <CardContent className="p-4">
+          {/* DEBUG INFO */}
+          <div className="bg-red-100 p-2 border border-red-500 text-xs font-mono mb-4">
+            <strong>DEBUG INFO:</strong><br />
+            ID: {currentPayroll?.id}<br />
+            Status: {currentPayroll?.status}<br />
+            HR Signed: {currentPayroll?.hr_signoff_at || 'NULL'}<br />
+            Finance Signed: {currentPayroll?.finance_signoff_at || 'NULL'}<br />
+            Computed Status: {actualPayrollStatus}
+          </div>
           <div className="flex flex-wrap items-center justify-between gap-4">
             {/* Status Badge and Lock Progress - Compact Layout */}
             <div className="flex flex-wrap items-center gap-4">
@@ -1093,7 +1234,7 @@ export function Employees() {
               )}
 
               {/* Finance Bulk Lock Buttons */}
-              {isFinance && actualPayrollStatus === 'hr_signed' && (
+              {isFinance && (actualPayrollStatus === 'hr_signed' || actualPayrollStatus === 'pending') && (
                 <>
                   {(lockStats?.finance_locked_count || 0) < (lockStats?.total_employees || 0) ? (
                     <Button
@@ -1133,11 +1274,11 @@ export function Employees() {
               )}
 
               {/* Finance Sign-off Button */}
-              {isFinance && actualPayrollStatus === 'hr_signed' && (
+              {isFinance && (actualPayrollStatus === 'hr_signed' || actualPayrollStatus === 'pending') && (
                 <Button
                   onClick={() => setShowFinanceSignoffModal(true)}
-                  disabled={!lockStats?.can_finance_signoff}
-                  title={!lockStats?.can_finance_signoff ? 'Lock all employees before signing off' : ''}
+                  disabled={!((lockStats?.finance_locked_count || 0) > 0 && (lockStats?.finance_locked_count === lockStats?.total_employees))}
+                  title={!((lockStats?.finance_locked_count || 0) > 0 && (lockStats?.finance_locked_count === lockStats?.total_employees)) ? 'Lock all employees before signing off' : ''}
                   size="sm"
                 >
                   <CheckCircle className="mr-2 h-4 w-4" />
@@ -1864,7 +2005,7 @@ export function Employees() {
       <FinanceSignoffModal
         open={showFinanceSignoffModal}
         onClose={() => setShowFinanceSignoffModal(false)}
-        onSuccess={handleSignoffSuccess}
+        onSuccess={handleFinanceSignoffSuccess}
         month={month}
         year={year}
         payrollId={currentPayroll?.id || ''}

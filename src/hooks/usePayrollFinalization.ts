@@ -445,13 +445,28 @@ export function usePayrollFinalization() {
         }
       }
 
-      // Check if can sign off (all employees locked, HR signed)
-      const { data: canSignoff } = await supabase
-        .rpc('can_finance_signoff', { p_payroll_id: payrollId })
-        .single()
+      interface PayrollLockStats {
+        total_employees: number
+        hr_locked_count: number
+        finance_locked_count: number
+        can_hr_signoff: boolean
+        can_finance_signoff: boolean
+      }
 
-      if (!canSignoff) {
-        throw new Error('Cannot sign off: Not all employees are locked or HR has not signed off')
+      // Check if can sign off (all employees locked)
+      // Note: We are checking this based on lock stats instead of the strict RPC
+      // to allow Finance to sign off independently of HR status
+      const { data: lockStats, error: statsError } = await supabase
+        .rpc('get_payroll_lock_stats', { p_payroll_id: payrollId })
+        .single<PayrollLockStats>()
+
+      if (statsError) throw statsError
+
+      const allLocked = lockStats.total_employees > 0 &&
+        lockStats.finance_locked_count === lockStats.total_employees
+
+      if (!allLocked) {
+        throw new Error('Cannot sign off: Not all employees are locked by Finance')
       }
 
       // Update ONLY this specific payroll
